@@ -3,16 +3,37 @@ const std = @import("std");
 const Io     = std.Io;
 const Stream = Io.net.Stream;
 
+const String = [:0]const u8;
 const Signature = struct {
-    signature: []const u8,
+    bytes: []const u8,
 };
-const ObjectPath = struct {
-    path: []const u8,
+pub const ObjectPath = struct {
+    bytes: []const u8,
+
+    pub fn init(path: []const u8) error{InvalidObjectPath}!ObjectPath {
+        if (path.len == 0 or path[0] != '/') return error.InvalidObjectPath;
+
+        var it = std.mem.splitScalar(u8, path[1..], '/');
+        while (it.next()) |slice| {
+            for (slice) |c| {
+                if ((c < 'A' or c > 'Z') and (c < 'a' or c > 'z') and (c < '0' or c > '9') and c != '_')
+                    return error.InvalidObjectPath;
+            }
+            if (slice.len == 0) return error.InvalidObjectPath;
+        }
+
+        if (path.len > 1 and path[path.len - 1] == '/') return error.InvalidObjectPath;
+        return .{.bytes = path};
+    }
+
+    pub fn initComptime(comptime path: []const u8) ObjectPath {
+        return comptime init(path) catch unreachable;
+    }
 };
 
 pub const Client = struct {
-    reader: Stream.Reader,
-    writer: Stream.Writer,
+    stream_reader: Stream.Reader,
+    stream_writer: Stream.Writer,
 
     written: usize = 0,
 
@@ -27,8 +48,8 @@ pub const Client = struct {
 
     pub fn init(io: Io, buf: []u8, stream: Stream) Client {
         return .{
-            .reader = stream.reader(io, buf[0..buf.len/2]),
-            .writer = stream.writer(io, buf[buf.len/2..]),
+            .stream_reader = stream.reader(io, buf[0..buf.len/2]),
+            .stream_writer = stream.writer(io, buf[buf.len/2..]),
         };
     }
 
@@ -87,12 +108,12 @@ pub const Client = struct {
     }
 
     fn sendAuthCommand(client: *Client, comptime format: []const u8, args: anytype) !void {
-        try client.writer.interface.print(format, args);
-        try client.writer.interface.writeAll("\r\n");
-        try client.writer.interface.flush();
+        try client.stream_writer.interface.print(format, args);
+        try client.stream_writer.interface.writeAll("\r\n");
+        try client.stream_writer.interface.flush();
     }
     fn expectAuthResponsePrefix(client: *Client, prefix: []const u8) AuthenticationError!void {
-        var line = try client.reader.interface.takeDelimiterInclusive('\n');
+        var line = try client.stream_reader.interface.takeDelimiterInclusive('\n');
         if (!std.mem.endsWith(u8, line, "\r\n")) return error.UnexpectedResponse;
         line = line[0..line.len - 2];
 
@@ -104,7 +125,7 @@ pub const Client = struct {
     }
 
     pub fn authenticate(client: *Client) AuthenticationError!void {
-        try client.writer.interface.writeByte(0);
+        try client.stream_writer.interface.writeByte(0);
 
         var uid_arr: [20]u8 = undefined;
 
@@ -117,11 +138,11 @@ pub const Client = struct {
         std.debug.print("Successfully authenticated with DBus\n", .{});
     }
 
-    fn alignTo(self: *Client, comptime bytes: usize) !void {
+    fn alignTo(self: *Client, writer: *Io.Writer, comptime bytes: usize) !void {
         if (bytes == 0) @compileError("cannot align to 0 bytes");
 
         const new = std.mem.alignForward(usize, self.written, bytes);
-        try self.writer.interface.splatByteAll(0, new - self.written);
+        try writer.splatByteAll(0, new - self.written);
         self.written = new;
     }
 
@@ -131,15 +152,53 @@ pub const Client = struct {
     };
     fn OperationArgs(operation: Operation, T: type) type {
         return switch (operation) {
-            .write => struct {value: T, endian: std.builtin.Endian, client: *Client},
+            .write => struct {value: T, endian: std.builtin.Endian, client: *Client, writer: *Io.Writer},
             .signature => *[]const u8,
         };
     }
 
+    inline fn combineStructs(Target: type, orig: anytype, updates: anytype) Target {
+        const Orig = @TypeOf(orig);
+        const Updates = @TypeOf(updates);
+        if (std.meta.fields(Updates).len == 0) return orig;
+
+        var new: Target = undefined;
+        inline for (std.meta.fields(Orig)) |f| {
+            if (!@hasField(Updates, f.name))
+                @field(new, f.name) = @field(orig, f.name);
+        }
+        inline for (std.meta.fields(Updates)) |f| {
+            @field(new, f.name) = @field(updates, f.name);
+        }
+        return new;
+    }
+    fn runValueOperationRecursive(comptime T: type, comptime Op: Operation, args_prev: anytype, new_args: anytype) !void {
+        return runValueOperation(T, Op, false, combineStructs(OperationArgs(Op, T), args_prev, new_args));
+    }
+
     fn runValueOperation(comptime T: type, comptime Op: Operation, toplevel: bool, args: OperationArgs(Op, T)) !void {
+        if (T == ObjectPath or T == String or T == Signature) {
+            switch (Op) {
+                .write => {
+                    const bytes: []const u8 = if (T == String) args.value else args.value.bytes;
+
+                    const Type = if (T == Signature) u8 else u32;
+                    try args.client.alignTo(args.writer, @sizeOf(Type));
+
+                    try args.writer.writeInt(Type, @intCast(bytes.len), args.endian);
+                    var iovec: [2][]const u8 = .{bytes, "\x00"};
+                    try args.writer.writeVecAll(&iovec);
+
+                    args.client.written += @sizeOf(Type) + bytes.len + 1;
+                },
+                .signature => args.* = args.* ++ if (T == String) "s" else if (T == Signature) "g" else "o",
+            }
+            return;
+        }
+
         switch (@typeInfo(T)) {
             .bool => return switch (Op) {
-                .write => runValueOperation(u32, Op, false, .{.value = @intFromBool(args.value), .endian = args.endian, .client = args.client}),
+                .write => runValueOperationRecursive(u32, Op, args, .{.value = @intFromBool(args.value)}),
                 .signature => "b",
             },
             .int => |i| {
@@ -151,8 +210,8 @@ pub const Client = struct {
                 const bytes = @divExact(i.bits, 8);
                 switch (Op) {
                     .write => {
-                        try args.client.alignTo(bytes);
-                        try args.client.writer.interface.writeInt(T, args.value, args.endian);
+                        try args.client.alignTo(args.writer, bytes);
+                        try args.writer.writeInt(T, args.value, args.endian);
                         args.client.written += bytes;
                     },
                     .signature => {
@@ -165,24 +224,24 @@ pub const Client = struct {
             },
             .@"enum" => |e| {
                 if (!e.is_exhaustive) @compileError("non-exhaustive enums not allowed");
-                return runValueOperation(e.tag_type, Op, false, switch (Op) {
-                    .write => .{.value = @intFromEnum(args.value), .endian = args.endian, .client = args.client},
-                    .signature => args,
+                return runValueOperationRecursive(e.tag_type, Op, args, switch (Op) {
+                    .write => .{.value = @intFromEnum(args.value) },
+                    .signature => .{},
                 });
             },
             .@"struct" => |s| {
                 if (s.layout == .@"packed") {
-                    if (s.backing_integer) |i| {
-                        return runValueOperation(i, Op, false, switch (Op) {
-                            .write => .{.value = @bitCast(args.value), .endian = args.endian, .client = args.client},
-                            .signature => args,
+                    if (s.backing_integer) |Int| {
+                        return runValueOperationRecursive(Int, Op, args, switch (Op) {
+                            .write => .{.value = @as(Int, @bitCast(args.value))},
+                            .signature => .{},
                         });
                     }
                     @compileError("packed structs without backing integer not supported");
                 }
 
                 switch (Op) {
-                    .write => try args.client.alignTo(8),
+                    .write => try args.client.alignTo(args.writer, 8),
                     .signature => if (!toplevel) {
                         args.* = args.* ++ "(";
                     }
@@ -193,9 +252,9 @@ pub const Client = struct {
                         @compileError("alignment on struct members not supported");
                     if (field.is_comptime) continue;
 
-                    try runValueOperation(field.type, Op, false, switch (Op) {
-                        .write => .{.value = @field(args.value, field.name), .endian = args.endian, .client = args.client},
-                        .signature => args,
+                    try runValueOperationRecursive(field.type, Op, args, switch (Op) {
+                        .write => .{.value = @field(args.value, field.name)},
+                        .signature => .{},
                     });
                 }
 
@@ -207,16 +266,36 @@ pub const Client = struct {
                 }
             },
             .pointer => |p| {
-                if (p.size != .slice) @compileError("pointer are not supported");
+                if (p.size != .slice) @compileError("pointers are not supported");
                 if (p.address_space != .generic) @compileError("address spaces not supported");
                 if (p.alignment != null) @compileError("aligned slices/pointers not supported");
                 if (!p.is_const) @compileError("non-const slices not supported");
 
                 switch (Op) {
-                    .write => @compileError("TODO: write slices"),
+                    .write => {
+                        const written = args.client.written;
+
+                        var buf: [64]u8 = undefined;
+                        var discarding: Io.Writer.Discarding = .init(&buf);
+                        {
+                            defer args.client.written = written;
+                            args.client.written = 0;
+
+                            for (args.value) |v| {
+                                try runValueOperationRecursive(p.child, Op, args, .{ .value = v, .writer = &discarding.writer });
+                            }
+                            try discarding.writer.flush();
+                            std.debug.assert(discarding.count == args.client.written);
+                        }
+
+                        try runValueOperationRecursive(u32, Op, args, .{ .value = @as(u32, @intCast(discarding.count)) });
+                        for (args.value) |v| {
+                            try runValueOperationRecursive(p.child, Op, args, .{ .value = v });
+                        }
+                    },
                     .signature => {
                         args.* = args.* ++ "a";
-                        return runValueOperation(p.child, Op, false, args);
+                        return runValueOperationRecursive(p.child, Op, args, .{});
                     },
                 }
             },
@@ -225,10 +304,24 @@ pub const Client = struct {
                     switch (@typeInfo(Inner)) {
                         .@"enum" => |e| {
                             switch (Op) {
-                                .write => @compileError("TODO: write tagged variants"),
+                                .write => {
+                                    // we enumate a struct here, so we also have to do struct alignment (8 bytes)
+                                    try args.client.alignTo(args.writer, 8);
+
+                                    try runValueOperationRecursive(e.tag_type, Op, args, .{ .value = @intFromEnum(std.meta.activeTag(args.value)) });
+                                    switch (args.value) {
+                                        inline else => |v| {
+                                            comptime var sig: []const u8 = "";
+                                            comptime runValueOperation(@TypeOf(v), .signature, true, &sig) catch unreachable;
+
+                                            try runValueOperationRecursive(Signature, Op, args, .{ .value = Signature{.bytes = sig} });
+                                            try runValueOperationRecursive(@TypeOf(v), Op, args, .{ .value = v });
+                                        }
+                                    }
+                                },
                                 .signature => {
                                     args.* = args.* ++ "(";
-                                    try runValueOperation(e.tag_type, Op, false, args);
+                                    try runValueOperationRecursive(e.tag_type, Op, args, .{});
                                     args.* = args.* ++ "v)";
                                 },
                             }
@@ -243,14 +336,17 @@ pub const Client = struct {
         }
     }
 
+    /// Writes a value `value` of any type supported by DBus to the socket references by `self`.
+    /// This function is NOT thread safe and expected to be executed atomically.
+    /// Doing otherwise may result in interleaved messages, missing data or duplicate writes.
     pub fn writeValueRaw(self: *Client, value: anytype, endian: std.builtin.Endian) !void {
-        try runValueOperation(@TypeOf(value), .write, true, .{.value = value, .endian = endian, .client = self});
-        try self.writer.interface.flush();
+        try runValueOperation(@TypeOf(value), .write, true, .{.value = value, .endian = endian, .client = self, .writer = &self.stream_writer.interface});
+        try self.stream_writer.interface.flush();
     }
 
     pub fn getSignature(T: type) ![]const u8 {
-        var signature: []const u8 = "";
-        try runValueOperation(T, .signature, true, &signature);
+        comptime var signature: []const u8 = "";
+        try comptime runValueOperation(T, .signature, true, &signature);
         return signature;
     }
 };
@@ -284,15 +380,17 @@ pub const Header = struct {
 
     fields: []const union(HeaderTag) {
         path:         ObjectPath,
-        interface:    []const u8,
-        member:       []const u8,
-        error_name:   []const u8,
+        interface:    String,
+        member:       String,
+        error_name:   String,
         reply_serial: u32,
-        destination:  []const u8,
-        sender:       []const u8,
+        destination:  String,
+        sender:       String,
         signature:    Signature,
         unix_fds:     u32,
     },
+
+    _align_to_8: struct {} = .{},
 
     const HeaderTag = enum(u8) {
         path = 1,
